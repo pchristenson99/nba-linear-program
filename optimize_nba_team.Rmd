@@ -1,0 +1,417 @@
+---
+title: "Using Linear Programming to Assemble an NBA Team"
+output: html_notebook
+---
+In this project, I use a linear programming model to assemble an NBA team. Specifically, I am interesting in maximizing the sum of some metric for the selected players on the team, while being constrained by the league salary cap and general positional requirements for building an effective team.
+```{r, results = 'hide'}
+# Set-up
+rm(list = ls())
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse,
+  lubridate,
+  magrittr,
+  readxl,
+  writexl,
+  survival,
+  zoo,
+  tidyr,
+  stringr,
+  janitor,
+  readr,
+  data.table,
+  lpSolve,
+  nbapalettes,
+  httr,
+  XML,
+  tidytext,
+  extrafont
+)
+
+# Directories
+INPUT <- "./input/"
+INTERMEDIATE <- "./intermediate/"
+OUTPUT <- "./output/"
+
+# Constants
+DATE <- Sys.Date()
+```
+
+### Data
+I downloaded data from the website [Basketball Reference](https://www.basketball-reference.com). Specifically, I downloaded two data sets: one is a data set containing advanced stats for each player in the 2022-23 season, and another provides player contracts from the 2023-24 season on. Thus, I am building my team based on performance from this past season (2022-23), but assuming players are paid their salary for the current (2023-24) season.
+``` {r, results = 'hide'}
+# Data on stats for players
+data_stats <- read_csv(
+  paste0(INPUT, "data_advanced_stats.csv"),
+  skip = 1
+) %>% 
+  clean_names() %>% 
+  select(-c(x1, rk)) %>% 
+  select(index = player_additional, everything()) %>%
+  arrange(index)
+
+# Data on salaries for players
+data_salary <- read_csv(
+  paste0(INPUT, "data_salary.csv"),
+  skip = 2
+) %>% 
+  clean_names() %>% 
+  rename_at(
+    vars(starts_with("x20")), ~paste0("salary_", str_sub(., 2))
+  ) %>% 
+  mutate(
+    across(contains("salary"), ~as.numeric(gsub("\\$", "", .)))
+  ) %>% 
+  select(index = x9999, everything()) %>% 
+  select(-c(x1, rk, guaranteed)) %>% 
+  arrange(index)
+
+head(data_stats)
+head(data_salary)
+```
+### Model Structure
+I consider two versions of the model: one that maximizes BPM (Box Plus/Minus), and another that maximizes VORP (Value Over Replacement Player). Generally, both are estimates of a player's overall contribution to his team, but since they are still different statistics, I would like to consider them both.
+
+Constraint-wise, the total payroll of the team must fall under the 2023-24 salary of $136 M^[*See* https://www.spotrac.com/nba/cap/]. Additionally, I would like to have at least two of every position (PG, SG, SF, PF, and C) on the team, but the 5 players in the starting lineup must represent all 5 positions. Furthermore, NBA rosters are limited to 15 players.^[*See* https://en.wikipedia.org/wiki/List_of_current_NBA_team_rosters#cite_note-1] 
+
+To make the team more representative of a "real" basketball team where the bulk of the team's payroll is invested in the starting lineup, I cap the amount of salary cap that can be spent on bench players at 30% of the salary cap. Additionally, I don't want more than 4 players from the same position on the team.
+
+The variables in the model are:
+
+1. \(s_i\) (integer): binary variables that indicates where player \(i\) is included in the starting lineup
+2. \(b_i\) (integer): binary variables that indicates where player \(i\) is included as a bench player
+3. \(c_i\) (continuous): measure of value (either BPM or VORP) for player \(i\)
+4. \(salary_i\) (continuous): 2023-24 salary for player \(i\)
+5. \(position_{i,j}\) (integer): whether player \(i\) plays position \(j\)
+
+Where \(n\) is the number of eligible players for the team.
+
+The resulting model is thus:
+\[max\sum_{i = 1} ^ {n} c_is_i + c_ib_i\]
+
+**Subject to:**
+\[\sum_{i = 1} ^ {n} salary_i s_i + salary_ib_i \le 136,000,000\]
+\[\sum_{i = 1} ^ {n} salary_ib_i \le 40,800,000\]
+\[\sum_{i = 1} ^ {n} s_i = 5\]
+\[\sum_{i = 1} ^ {n} s_i + b_i \le 15\]
+\[\sum_{i = 1} ^ {n} s_iposition_{i,j} = 1 \Rightarrow\forall j = 1,...,5\]
+\[\sum_{i = 1} ^ {n} s_iposition_{i,j} + b_iposition_{i,j} \ge 2 \Rightarrow\forall j = 1,...,5\]
+\[\sum_{i = 1} ^ {n} s_iposition_{i,j} + b_iposition_{i,j} \le 4 \Rightarrow\forall j = 1,...,5\]
+\[s_i \le 1 - b_i \Rightarrow\forall i = 1,...,n\]
+\[s_i \in \{0, 1\} \Rightarrow\forall i = 1,...,n\]
+\[b_i \in \{0, 1\} \Rightarrow\forall i = 1,...,n\]
+
+``` {r, results = 'hide'}
+# Prep data for LP
+lp_data <- data_stats %>% 
+  # Duplicates for players with multiple teams: take "TOT" (total) for LP
+  group_by(index) %>% 
+  mutate(ct = n()) %>% 
+  ungroup() %>% 
+  filter(ct == 1 | tm == "TOT") %>% 
+  left_join(data_salary %>% 
+              select(-c(tm, player)) %>% 
+              distinct()) %>% 
+  # Consider:
+  ## Only players with salary data
+  ## Played 100 or minutes in the 2022-23 season
+  filter(!is.na(salary_2023_24),
+         mp >= 100) %>% 
+  # For position, if player has multiple positions listed, assume first is the position they play more
+  mutate(pos = gsub("-.*", "", pos)) %>% 
+  select(index, player, pos, bpm, vorp, salary = salary_2023_24)
+
+head(lp_data)
+```
+
+To solve the mode, I use the package `lpSolve`.^[*See* https://cran.r-project.org/web/packages/lpSolve/index.html]
+
+### Solving
+``` {r, results = 'hide'}
+#----- Set-up -----#
+solve.lp <- function(metric) {
+  n <- nrow(lp_data)
+  salary_cap <- 136e6
+  salary_cap_bench_pct <- 0.25
+  
+  player_positions <- lp_data %>% 
+    mutate(n = 1) %>%
+    pivot_wider(names_from = pos, values_from = n, values_fill = list(n = 0),
+                names_glue = "pos_{pos}") %>% 
+    clean_names() %>% 
+    select(contains("pos_"))
+  mat_player_pos <- t(player_positions)
+  
+  #----- Objective function -----#
+  
+  # Create coefficient vectors for each component
+  coef_s <- lp_data[, metric] %>% pull()  # coefficients for s_i
+  coef_b <- lp_data[, metric] %>% pull()  # coefficients for b_i
+  
+  # Combine the coefficient vectors to form the complete objective function
+  obj <- c(coef_s, coef_b)
+  
+  #----- Constraints -----#
+  
+  # Constraint 1: salary (entire team)
+  salary_s <- lp_data$salary
+  salary_b <- lp_data$salary
+  cons1_mat <- matrix(c(salary_s, salary_b), nrow = 1)
+  cons1_dir <- "<="
+  cons1_rhs <- salary_cap
+  
+  # Constraint 2: salary (bench)
+  cons2_mat <- matrix(c(numeric(n), salary_b), nrow = 1)
+  cons2_dir <- "<="
+  cons2_rhs <- salary_cap*salary_cap_bench_pct
+  
+  # Constraint 3: number of starters
+  cons3_mat <- matrix(c(rep(1, n), numeric(n)), nrow = 1)
+  cons3_dir <- "="
+  cons3_rhs <- 5
+  
+  # Constraint 4: number of players
+  cons4_mat <- matrix(c(rep(1, n), rep(1, n)), nrow = 1)
+  cons4_dir <- "<="
+  cons4_rhs <- 15
+  
+  # Constraint 5: all 5 positions in starting lineup
+  cons5_mat <- cbind(mat_player_pos, matrix(nrow = 5, ncol = n))
+  cons5_dir <- "="
+  cons5_rhs <- 1
+  
+  # Constraint 6: At least 2 of every position on team
+  cons6_mat <- cbind(mat_player_pos, mat_player_pos)
+  cons6_dir <- ">="
+  cons6_rhs <- 2
+  
+  # Constraint 7: no player can both be a starter and bench player
+  cons7_mat <- cbind(diag(n), diag(n))
+  cons7_dir <- "<="
+  cons7_rhs <- 1
+  
+  # Constraint 8: no more than 4 players from the same position on the team
+  cons8_mat <- cbind(mat_player_pos, mat_player_pos)
+  cons8_dir <- "<="
+  cons8_rhs <- 4
+  
+  
+  #----- Solve -----#
+  cons_all <- rbind(
+    cons1_mat,
+    cons2_mat,
+    cons3_mat,
+    cons4_mat,
+    cons5_mat,
+    cons6_mat,
+    cons7_mat,
+    cons8_mat
+  )
+  
+  dir_all <- c(
+    rep(cons1_dir, nrow(cons1_mat)),
+    rep(cons2_dir, nrow(cons2_mat)),
+    rep(cons3_dir, nrow(cons3_mat)),
+    rep(cons4_dir, nrow(cons4_mat)),
+    rep(cons5_dir, nrow(cons5_mat)),
+    rep(cons6_dir, nrow(cons6_mat)),
+    rep(cons7_dir, nrow(cons7_mat)),
+    rep(cons8_dir, nrow(cons8_mat))
+  )
+  
+  rhs_all <- c(
+    rep(cons1_rhs, nrow(cons1_mat)),
+    rep(cons2_rhs, nrow(cons2_mat)),
+    rep(cons3_rhs, nrow(cons3_mat)),
+    rep(cons4_rhs, nrow(cons4_mat)),
+    rep(cons5_rhs, nrow(cons5_mat)),
+    rep(cons6_rhs, nrow(cons6_mat)),
+    rep(cons7_rhs, nrow(cons7_mat)),
+    rep(cons8_rhs, nrow(cons8_mat))
+  )
+  
+  solution <- lp("max", obj, cons_all, dir_all, rhs_all, all.bin = T)
+  solution_index <- solution$solution
+  solution_players <- rbind(lp_data, lp_data)[solution_index == 1, ]
+  solution_players %<>%
+    mutate(role = ifelse(row_number() <= 5, "starter", "bench player"))
+  
+  return(solution_players)
+}
+
+team_bpm <- solve.lp("bpm")
+team_vorp <- solve.lp("vorp")
+```
+A team optimized for **BPM** looks like:
+``` {r, echo = F}
+print(team_bpm %>% 
+        select(-index) %>% 
+        select(role, everything()) %>% 
+        arrange(desc(role), pos))
+```
+A team optimized for **VORP** for looks like:
+``` {r, echo = F}
+print(team_vorp %>% 
+        select(-index) %>% 
+        select(role, everything()) %>% 
+        arrange(desc(role), pos))
+```
+### Analysis of Results
+
+To get a sense for how strong of a team the program assembled, I compare the team minutes-per-game weighted average BPM/VORP of the program generated team to the rest of the NBA. But before this comparison can be performed, I must allocate how many minutes I expect players on the program generated team to play. To do this, I assume the team uses a 10 player rotation (i.e., only 10 players on the team actually play), in line with a typical 8-10 player rotation.^[*See* https://gamefaqs.gamespot.com/boards/2000208-sports-and-racing-nba/66049885] I will assume the players that are part of the rotation are the top two players at each position (in terms of the metric optimized). I will assign minutes to each player by multiplying the length of an NBA game (48 minutes) by the player's share of total BPM/VORP at that position.^[*See* https://official.nba.com/rule-no-5-scoring-and-timing/] I will also bound the most minutes a player can play at 35 minutes, which is roughly around the most a player will play in a game.^[*See* https://www.espn.com/nba/seasonleaders/_/league/nba/sort/avgMinutes/year/2023]
+
+``` {r, results = 'hide'}
+# Combine teams into one dataframe
+team_all <- rbind(
+  team_bpm %>% 
+    select(index:pos, role, metric = bpm) %>% 
+    mutate(lp_team = "bpm"),
+  team_vorp %>% 
+    select(index:pos, role, metric = vorp) %>% 
+    mutate(lp_team = "vorp")
+)
+
+# Calculate MPG
+NBA_GAME_LENGTH <- 48
+MPG_MAX <- 35
+mpg_lp <- team_all %>% 
+  group_by(lp_team, pos) %>% 
+  slice_max(metric, n = 2) %>% 
+  ungroup() %>% 
+  group_by(lp_team, pos) %>% 
+  mutate(mpg = metric/sum(metric) * NBA_GAME_LENGTH) %>% 
+  ungroup() %>% 
+  mutate(mpg = case_when(
+    mpg >= MPG_MAX ~ MPG_MAX,
+    mpg <= NBA_GAME_LENGTH - MPG_MAX ~ NBA_GAME_LENGTH - MPG_MAX,
+    T ~ mpg
+  ))
+
+# Add onto team dataframe
+team_all %<>%
+  left_join(mpg_lp) %>% 
+  mutate(mpg = replace_na(mpg, 0)) %>% 
+  select(lp_team, everything())
+
+# Calculate MPG-weighted means
+mpg_avg <- team_all %>% 
+  group_by(lp_team) %>% 
+  summarize(team_avg = weighted.mean(metric, mpg)) %>% 
+  ungroup()
+```
+The minutes each player plays:
+``` {r, echo = F}
+team_all
+```
+The MPG-weighted means:
+``` {r, echo = F}
+mpg_avg
+```
+### Visualization
+A visualization of a comparison of the model's team against the rest of the NBA (the top 10 for each metric):
+``` {r, results = 'hide'}
+# Get average for each team
+team_avg <- data_stats %>% 
+  filter(mp >= 100) %>%  # Only players with more than 100 minutes played
+  mutate(mpg = mp/g) %>% 
+  filter(tm != "TOT") %>% 
+  group_by(tm) %>% 
+  summarize(bpm  = weighted.mean(bpm, mpg),
+            vorp = weighted.mean(vorp, mpg)) %>% 
+  ungroup() %>% 
+  pivot_longer(c(bpm, vorp), names_to = "metric", values_to = "weighted_avg") %>% 
+  rbind(
+    mpg_avg %>% 
+      mutate(tm = "Linear Program") %>% 
+      rename(metric = lp_team, weighted_avg = team_avg)
+  )
+
+# Get team names for abbreviations
+url <- "https://en.wikipedia.org/wiki/Wikipedia:WikiProject_National_Basketball_Association/National_Basketball_Association_team_abbreviations"
+request <- GET(url)
+tables <- readHTMLTable(doc=content(request, "text"))
+
+team_names <- as.data.frame(tables[1]) %>% 
+  filter(row_number() > 1) %>% 
+  rename(abbr = 1, name = 2) %>% 
+  mutate(abbr = str_sub(abbr, 1, 3)) %>% 
+  rowwise() %>% 
+  mutate(name = word(name, -1)) %>% 
+  ungroup()
+
+# Add on team colors for plot
+team_colors <- available_palettes() %>% 
+  filter(teams == palette_names) %>% 
+  mutate(color = gsub(",.*", "", palette_colors)) %>% 
+  select(name = teams, color) %>% 
+  mutate(name = recode(name, "sixers" = "76ers"),
+         name = str_to_title(name))
+
+team_names %<>%
+  left_join(team_colors)
+
+# Dataframe for plotting
+plot_df <- team_avg %>% 
+  mutate(tm = recode(tm,
+                     "BRK" = "BKN",
+                     "CHO" = "CHA",
+                     "PHO" = "PHX")) %>% 
+  left_join(team_names, by = c("tm" = "abbr")) %>% 
+  mutate(
+    name  = ifelse(tm == "Linear Program", "Linear Program", name),
+    color = ifelse(tm == "Linear Program", "#7F7F7F", color) 
+  ) %>% 
+  group_by(metric) %>% 
+  slice_max(weighted_avg, n=10) %>% 
+  ungroup() %>% 
+  mutate(name = reorder_within(name, weighted_avg, metric),
+         metric = toupper(metric))
+
+# Plot
+ggplot(plot_df) +
+  geom_bar(aes(weighted_avg, name, fill = color), stat = "identity") +
+  facet_wrap(~metric, scales = "free", ncol = 1) +
+  theme_minimal() +
+  scale_y_reordered() +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_fill_identity() +
+  theme(
+    axis.title.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    text = element_text(family = "Tahoma")
+  ) +
+  labs(x = "MPG-weighted Average")
+```
+As the plot above shows, the team created by our model has a far greater average BPM/VORP than any other team in the NBA. However, it would be helpful to assess how relevant this is to a team's win/loss record. To do this, I see how correlated MPG-weighted BPM/VORP is to a team's winning percentage.
+``` {r, results = 'hide'}
+# Standings data
+data_standings <- read_csv(
+  paste0(INPUT, "data_standings.csv"),
+  skip = 2
+) %>% 
+  clean_names() %>% 
+  select(team, overall) %>% 
+  mutate(win_pct = as.numeric(gsub("-.*", "", overall))/82) %>% 
+  select(team, win_pct) %>% 
+  rowwise() %>% 
+  mutate(team = word(team, -1)) %>% 
+  ungroup() %>% 
+  left_join(team_names, by = c("team" = "name")) %>% 
+  select(-color) %>% 
+    mutate(abbr = recode(abbr,
+                     "BKN" = "BRK",
+                     "CHA" = "CHO",
+                     "PHX" = "PHO")) %>% 
+  left_join(team_avg, by = c("abbr" = "tm")) %>% 
+  pivot_wider(names_from = metric, values_from = weighted_avg) %>% 
+  select(-abbr)
+
+data_standings
+```
+``` {r}
+# Correlation - BPM
+cor.test(data_standings$win_pct, data_standings$bpm)
+# Correlation - VORP
+cor.test(data_standings$win_pct, data_standings$vorp)
+```
+There is a strong positive correlation between a team's winning percentage and each of our calculated metrics. Thus, it is probably fair to say that either team generated by the linear program would win a lot of games!
